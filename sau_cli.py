@@ -32,6 +32,7 @@ from uploader.xiaohongshu_uploader.main import (
     XiaoHongShuNote,
     XiaoHongShuVideo,
     cookie_auth as xiaohongshu_cookie_auth,
+    cookie_auth as xxhs_cookie_auth,
     xiaohongshu_setup,
 )
 
@@ -130,6 +131,17 @@ class BilibiliVideoUploadRequest:
     tid: int
     tags: list[str]
     publish_date: datetime | int
+
+
+@dataclass(slots=True)
+class XhsVideoUploadRequest:
+    account_name: str
+    video_file: Path
+    title: str
+    tags: list[str]
+    publish_date: datetime | int
+    debug: bool = True
+    headless: bool = True
 
 
 def has_interactive_terminal() -> bool:
@@ -232,6 +244,18 @@ async def check_bilibili_account(account_name: str) -> bool:
         return False
     result = run_biliup_command(["-u", str(account_file), "renew"])
     return result.returncode == 0
+
+
+async def login_xhs_account(account_name: str, headless: bool = True) -> dict:
+    account_file = resolve_account_file("xhs", account_name)
+    return await xiaohongshu_setup(str(account_file), handle=True, return_detail=True, headless=headless)
+
+
+async def check_xhs_account(account_name: str) -> bool:
+    account_file = resolve_account_file("xhs", account_name)
+    if not account_file.exists():
+        return False
+    return await xxhs_cookie_auth(str(account_file))
 
 
 async def upload_video(request: DouyinVideoUploadRequest) -> Path:
@@ -408,6 +432,25 @@ async def upload_bilibili_video(request: BilibiliVideoUploadRequest) -> Path:
     return account_file
 
 
+async def upload_xhs_video(request: XhsVideoUploadRequest) -> Path:
+    account_file = resolve_account_file("xhs", request.account_name)
+    is_ready = await xiaohongshu_setup(str(account_file), handle=False)
+    if not is_ready:
+        raise RuntimeError(
+            f"XHS cookie is missing or expired: {account_file}. Run `sau xhs login --account {request.account_name}` first."
+        )
+
+    app = XiaoHongShuVideo(
+        title=request.title,
+        file_path=str(request.video_file),
+        tags=request.tags,
+        publish_date=request.publish_date,
+        account_file=str(account_file),
+    )
+    await app.main()
+    return account_file
+
+
 def existing_file_path(value: str) -> Path:
     path = Path(value)
     if not path.is_file():
@@ -541,6 +584,24 @@ def build_parser() -> argparse.ArgumentParser:
     bilibili_upload_video_parser.add_argument("--tid", required=True, type=int, help="Bilibili category id")
     bilibili_upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     bilibili_upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
+
+    xhs_parser = platform_parsers.add_parser("xhs", help="XHS operations")
+    xhs_actions = xhs_parser.add_subparsers(dest="action", required=True)
+
+    for action_name in ("login", "check"):
+        action_parser = xhs_actions.add_parser(action_name, help=f"XHS {action_name}")
+        action_parser.add_argument("--account", required=True, help="XHS user-defined account_name")
+        if action_name == "login":
+            add_runtime_flags(action_parser)
+
+    xhs_upload_video_parser = xhs_actions.add_parser("upload-video", help="Upload one video to XHS")
+    xhs_upload_video_parser.add_argument("--account", required=True, help="XHS user-defined account_name")
+    xhs_upload_video_parser.add_argument("--file", required=True, type=existing_file_path, help="Video file path")
+    xhs_upload_video_parser.add_argument("--title", required=True, help="Video title")
+    xhs_upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
+    xhs_upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
+    add_runtime_flags(xhs_upload_video_parser)
+
     return parser
 
 
@@ -727,6 +788,35 @@ async def dispatch(args: argparse.Namespace) -> int:
             return 0
 
         raise RuntimeError(f"Unsupported Bilibili action: {args.action}")
+
+    if args.platform == "xhs":
+        if args.action == "login":
+            result = await login_xhs_account(args.account, headless=args.headless)
+            if not result["success"]:
+                raise RuntimeError(result["message"])
+            print(f"XHS login flow completed: {result['account_file']}")
+            return 0
+
+        if args.action == "check":
+            is_valid = await check_xhs_account(args.account)
+            print("valid" if is_valid else "invalid")
+            return 0 if is_valid else 1
+
+        if args.action == "upload-video":
+            request = XhsVideoUploadRequest(
+                account_name=args.account,
+                video_file=args.file,
+                title=args.title,
+                tags=parse_tags(args.tags),
+                publish_date=args.schedule or 0,
+                debug=args.debug,
+                headless=args.headless,
+            )
+            await upload_xhs_video(request)
+            print(f"XHS video upload submitted: {request.video_file}")
+            return 0
+
+        raise RuntimeError(f"Unsupported XHS action: {args.action}")
 
     raise RuntimeError(f"Unsupported platform: {args.platform}")
 
